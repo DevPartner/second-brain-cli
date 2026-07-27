@@ -4,10 +4,10 @@ A Rust workspace for indexing markdown notes with local vector embeddings and ex
 
 Two binaries:
 
-| Crate | Binary | Role |
-|---|---|---|
-| `sb` | `sb` | CLI — manage collections, index markdown, store embeddings |
-| `sb-mcp-local-webserver` | `sb-mcp-server` | HTTP + MCP adapter — proxies search requests to `sb` |
+| Crate                    | Binary          | Role                                                       |
+| ------------------------ | --------------- | ---------------------------------------------------------- |
+| `sb`                     | `sb`            | CLI — manage collections, index markdown, store embeddings |
+| `sb-mcp-local-webserver` | `sb-mcp-server` | HTTP + MCP adapter — proxies search requests to `sb`       |
 
 ## How it works
 
@@ -56,7 +56,7 @@ sb collection rm notes
 
 **`sb collection ls` output:**
 
-```
+```text
 NAME                 PATH                                     DOCS   CHUNKS  LAST INDEXED (UTC)
 notes                /home/user/notes                          142     2840   2026-07-26T14:00:00+00:00
 ```
@@ -126,7 +126,7 @@ Health check — returns `"sb-mcp server is running"`.
 
 ### MCP endpoint
 
-```
+```text
 http://localhost:3000/mcp
 ```
 
@@ -162,22 +162,22 @@ Each search result returned from `sb` contains:
 
 ## Configuration
 
-| Variable | Default | Description |
-|---|---|---|
-| `SB_CMD` | `sb` | Command used to invoke the `sb` binary. Supports prefix args: `node C:/path/sb` |
-| `PORT` | `3000` | HTTP port for `sb-mcp-server` |
-| `SB_DB` | `~/.sb/sb.db` | SQLite database path (also overridable with `--db` in `sb`) |
+| Variable | Default       | Description                                                                     |
+| -------- | ------------- | ------------------------------------------------------------------------------- |
+| `SB_CMD` | `sb`          | Command used to invoke the `sb` binary. Supports prefix args: `node C:/path/sb` |
+| `PORT`   | `3000`        | HTTP port for `sb-mcp-server`                                                   |
+| `SB_DB`  | `~/.sb/sb.db` | SQLite database path (also overridable with `--db` in `sb`)                     |
 
 ## Database schema
 
 All data lives in a single SQLite file (`~/.sb/sb.db`):
 
-| Table | Purpose |
-|---|---|
-| `collections` | Registered directories, creation time, last indexed time |
-| `documents` | Per-file metadata: title, tags, doc type, front matter fields |
-| `chunks` | Text chunks (max 512 chars each) produced by the splitter |
-| `vec_chunks` | sqlite-vec virtual table — 1024-dimensional float embeddings, rowid-linked to `chunks` |
+| Table         | Purpose                                                                                |
+| ------------- | -------------------------------------------------------------------------------------- |
+| `collections` | Registered directories, creation time, last indexed time                               |
+| `documents`   | Per-file metadata: title, tags, doc type, front matter fields                          |
+| `chunks`      | Text chunks (max 512 chars each) produced by the splitter                              |
+| `vec_chunks`  | sqlite-vec virtual table — 1024-dimensional float embeddings, rowid-linked to `chunks` |
 
 ## Text processing pipeline
 
