@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "sb-mcp-local-webserver",
+    "sb"
+]
+resolver = "2"

@@ -1,0 +1,5 @@
+name: Second Brain Web Server (Rust)
+description: Simple HTTP adapter exposing sb util (Second Brain) search as MCP-compatible endpoints
+
+build: "cargo build --verbose"
+validate: "cargo check"
