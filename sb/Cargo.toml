@@ -6,7 +6,7 @@ description = "Second Brain CLI — index markdown notes and retrieve by vector"
 
 [dependencies]
 foundry-local-sdk = "1.2"
-tokio             = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio             = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 rusqlite          = { version = "0.32", features = ["bundled"] }
 sqlite-vec        = "0.1.6"
 zerocopy          = { version = "0.7", features = ["derive"] }
@@ -22,6 +22,7 @@ chrono            = { version = "0.4", features = ["serde"] }
 anyhow            = "1"
 symspell          = "0.4"
 globset           = "0.4"
+dotenvy           = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 foundry-local-sdk = { version = "1.2", features = ["winml"] }

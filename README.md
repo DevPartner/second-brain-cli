@@ -41,7 +41,6 @@ Collections are named groups of markdown files, similar to Docker containers for
 
 ```sh
 # Register a directory as a collection and index it
-sb collection add ~/notes --name notes
 sb collection add ~/notes --name notes --description "Personal knowledge base"
 
 # List all collections
