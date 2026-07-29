@@ -10,14 +10,26 @@ use zerocopy::AsBytes;
 
 const ALIAS: &str = "qwen3-embedding-0.6b";
 
+macro_rules! vlog {
+    ($verbose:expr, $($arg:tt)*) => {
+        if $verbose {
+            let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
+            println!("[VERBOSE] {} {}", ts, format!($($arg)*));
+        }
+    };
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "sb", about = "Second Brain — index and retrieve markdown notes")]
+#[command(name = "sb", about = "Second Brain — index and retrieve markdown notes", arg_required_else_help = true)]
 struct Cli {
     /// Path to the SQLite database (default: ~/.sb/sb.db, override with SB_DB)
     #[arg(long, global = true)]
     db: Option<PathBuf>,
+    /// Enable step-by-step diagnostic output
+    #[arg(long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -71,17 +83,22 @@ enum CollectionCommands {
 
 // ── DB ────────────────────────────────────────────────────────────────────────
 
-fn db_path_default() -> PathBuf {
+fn sb_home() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".sb").join("sb.db")
+    PathBuf::from(home).join(".sb")
 }
 
-fn db_open(path: &Path) -> anyhow::Result<Connection> {
+fn db_path_default() -> PathBuf {
+    sb_home().join("sb.db")
+}
+
+fn db_open(path: &Path, verbose: bool) -> anyhow::Result<Connection> {
     use std::sync::OnceLock;
     static VEC_REGISTERED: OnceLock<()> = OnceLock::new();
 
+    let t = std::time::Instant::now();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -90,6 +107,7 @@ fn db_open(path: &Path) -> anyhow::Result<Connection> {
     });
     let conn = Connection::open(path)?;
     create_schema(&conn)?;
+    vlog!(verbose, "db_open({}) -> ok (duration={:.1}ms)", path.display(), t.elapsed().as_secs_f64() * 1000.0);
     Ok(conn)
 }
 
@@ -142,14 +160,21 @@ struct DocMeta {
 
 // ── Pipeline ──────────────────────────────────────────────────────────────────
 
-fn build_symspell() -> symspell::SymSpell<symspell::AsciiStringStrategy> {
+fn build_symspell(verbose: bool) -> symspell::SymSpell<symspell::AsciiStringStrategy> {
+    let t = std::time::Instant::now();
     let mut sym = symspell::SymSpell::default();
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into());
-    let dict_path = PathBuf::from(&home).join(".sb").join("en-80k.txt");
+    let (dict_path, dict_source) = if let Ok(val) = std::env::var("SB_DICT") {
+        let raw = PathBuf::from(val);
+        let p = if raw.is_absolute() { raw } else { sb_home().join(&raw) };
+        (p, "SB_DICT env")
+    } else {
+        (sb_home().join("en-80k.txt"), "default")
+    };
     if dict_path.exists() {
         sym.load_dictionary(dict_path.to_str().unwrap_or(""), 0, 1, " ");
+        vlog!(verbose, "build_symspell() -> dict loaded from {} (source: {dict_source}, duration={:.1}ms)", dict_path.display(), t.elapsed().as_secs_f64() * 1000.0);
+    } else {
+        vlog!(verbose, "build_symspell() -> no dict at {}, spell correction disabled (source: {dict_source}, duration={:.1}ms)", dict_path.display(), t.elapsed().as_secs_f64() * 1000.0);
     }
     sym
 }
@@ -190,21 +215,105 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
 
 // ── Embed ─────────────────────────────────────────────────────────────────────
 
+// WinML does not support batch array input — embed one text at a time with retry.
+async fn embed_one(
+    client: &foundry_local_sdk::openai::EmbeddingClient,
+    text: &str,
+    verbose: bool,
+) -> anyhow::Result<Vec<f32>> {
+    for attempt in 1..=3u32 {
+        if attempt > 1 {
+            let delay_ms = 500u64 * (1u64 << (attempt - 2));
+            vlog!(verbose, "embed_one: retry {attempt}/3 (waiting {delay_ms}ms)");
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        let t_attempt = std::time::Instant::now();
+        match client.generate_embedding(text).await {
+            Ok(response) => {
+                let embedding = response
+                    .data
+                    .into_iter()
+                    .next()
+                    .map(|d| d.embedding)
+                    .ok_or_else(|| anyhow::anyhow!("empty embedding response"))?;
+                vlog!(
+                    verbose,
+                    "embed_one: successful embedding on attempt {attempt}/3 (duration={:.1}ms)",
+                    t_attempt.elapsed().as_secs_f64() * 1000.0
+                );
+                return Ok(embedding);
+            }
+            Err(e) if attempt < 3 => {
+                vlog!(verbose, "embed_one attempt {attempt}/3 failed: {e}");
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!()
+}
+
 async fn embed_batch(
     client: &foundry_local_sdk::openai::EmbeddingClient,
     texts: &[String],
+    verbose: bool,
 ) -> anyhow::Result<Vec<Vec<f32>>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BATCH_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+    let t_batch = std::time::Instant::now();
     if texts.is_empty() {
+        vlog!(verbose, "embed_batch() -> 0 embeddings (empty input)");
         return Ok(vec![]);
     }
-    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let response = client.generate_embeddings(&refs).await?;
-    Ok(response.data.into_iter().map(|d| d.embedding).collect())
+
+    if !BATCH_UNSUPPORTED.load(Ordering::Relaxed) {
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        match client.generate_embeddings(&refs).await {
+            Ok(response) => {
+                let results: Vec<Vec<f32>> =
+                    response.data.into_iter().map(|d| d.embedding).collect();
+                vlog!(
+                    verbose,
+                    "embed_batch(texts={}) -> {} embeddings (batch, duration={:.1}ms)",
+                    texts.len(),
+                    results.len(),
+                    t_batch.elapsed().as_secs_f64() * 1000.0
+                );
+                return Ok(results);
+            }
+            Err(e) => {
+                BATCH_UNSUPPORTED.store(true, Ordering::Relaxed);
+                vlog!(
+                    verbose,
+                    "embed_batch: batch operation failed ({e}); WinML does not support batch array input — falling back to embed_one (slower)"
+                );
+                eprintln!(
+                    "Warning: batch embedding unsupported ({e}); falling back to one-at-a-time."
+                );
+            }
+        }
+    } else {
+        vlog!(verbose, "embed_batch: batch known unsupported, using embed_one");
+    }
+
+    let mut results = Vec::with_capacity(texts.len());
+    for text in texts {
+        results.push(embed_one(client, text, verbose).await?);
+    }
+    vlog!(
+        verbose,
+        "embed_batch(texts={}) -> {} embeddings (sequential fallback, duration={:.1}ms)",
+        texts.len(),
+        results.len(),
+        t_batch.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(results)
 }
 
 // ── Index ─────────────────────────────────────────────────────────────────────
 
-fn load_search_exclusions(root: &Path) -> globset::GlobSet {
+fn load_search_exclusions(root: &Path, verbose: bool) -> globset::GlobSet {
+    let t = std::time::Instant::now();
     let mut current = Some(root);
     while let Some(dir) = current {
         let settings_path = dir.join(".vscode").join("settings.json");
@@ -213,16 +322,26 @@ fn load_search_exclusions(root: &Path) -> globset::GlobSet {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                     if let Some(exclude) = json.get("search.exclude") {
                         let mut builder = globset::GlobSetBuilder::new();
+                        let mut count = 0usize;
                         if let Some(map) = exclude.as_object() {
                             for (pattern, enabled) in map {
                                 if enabled.as_bool().unwrap_or(false) {
                                     if let Ok(glob) = globset::Glob::new(pattern) {
                                         builder.add(glob);
+                                        count += 1;
                                     }
                                 }
                             }
                         }
                         if let Ok(set) = builder.build() {
+                            vlog!(
+                                verbose,
+                                "load_search_exclusions({}) -> {} patterns from {} (duration={:.1}ms)",
+                                root.display(),
+                                count,
+                                settings_path.display(),
+                                t.elapsed().as_secs_f64() * 1000.0
+                            );
                             return set;
                         }
                     }
@@ -231,6 +350,7 @@ fn load_search_exclusions(root: &Path) -> globset::GlobSet {
         }
         current = dir.parent();
     }
+    vlog!(verbose, "load_search_exclusions({}) -> no exclusions found (duration={:.1}ms)", root.display(), t.elapsed().as_secs_f64() * 1000.0);
     globset::GlobSetBuilder::new()
         .build()
         .unwrap_or_else(|_| globset::GlobSet::empty())
@@ -246,25 +366,20 @@ async fn run_index(
     path: &Path,
     collection: &str,
     force: bool,
+    verbose: bool,
 ) -> anyhow::Result<()> {
-    let manager = FoundryLocalManager::create(FoundryLocalConfig::new("sb"))?;
-    let model = manager.catalog().get_model(ALIAS).await?;
-    if !model.is_cached().await? {
-        println!("Downloading embedding model...");
-        model
-            .download(Some(|p: f64| {
-                print!("\r  {p:.1}%");
-                std::io::Write::flush(&mut std::io::stdout()).ok();
-            }))
-            .await?;
-        println!();
-    }
-    model.load().await?;
-    let client = model.create_embedding_client();
+    vlog!(
+        verbose,
+        "run_index(path={}, collection={}, force={})",
+        path.display(),
+        collection,
+        force
+    );
 
-    let conn = db_open(db_path)?;
+    let conn = db_open(db_path, verbose)?;
 
     if force {
+        vlog!(verbose, "run_index: force-clearing existing data for collection '{collection}'");
         conn.execute(
             "DELETE FROM vec_chunks WHERE rowid IN \
              (SELECT id FROM chunks WHERE document_id IN \
@@ -279,8 +394,8 @@ async fn run_index(
         conn.execute("DELETE FROM documents WHERE collection = ?1", [collection])?;
     }
 
-    let exclusions = load_search_exclusions(path);
-    let sym = build_symspell();
+    let exclusions = load_search_exclusions(path, verbose);
+    let sym = build_symspell(verbose);
     let mut chunk_records: Vec<ChunkRecord> = Vec::new();
 
     for entry in WalkDir::new(path).into_iter().filter_entry(|e| {
@@ -312,6 +427,7 @@ async fn run_index(
                 .map(|n| n > 0)
                 .unwrap_or(false);
             if exists {
+                vlog!(verbose, "run_index: skipping already-indexed file {rel_path_str}");
                 continue;
             }
         }
@@ -373,13 +489,36 @@ async fn run_index(
             "UPDATE collections SET last_indexed_at_utc = ?1 WHERE name = ?2",
             rusqlite::params![Utc::now().to_rfc3339(), collection],
         )?;
+        vlog!(verbose, "run_index(collection={collection}) -> 0 new chunks");
         return Ok(());
     }
 
+    let model_alias = std::env::var("SB_MODEL").unwrap_or_else(|_| ALIAS.to_string());
+    vlog!(verbose, "run_index: loading embedding model '{model_alias}'");
+    let t_model = std::time::Instant::now();
+    let manager = FoundryLocalManager::create(FoundryLocalConfig::new("sb"))?;
+    let model = manager.catalog().get_model(&model_alias).await?;
+    if !model.is_cached().await? {
+        println!("Downloading embedding model...");
+        model
+            .download(Some(|p: f64| {
+                print!("\r  {p:.1}%");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+            }))
+            .await?;
+        println!();
+    }
+    model.load().await?;
+    vlog!(verbose, "run_index: embedding model loaded (duration={:.1}ms)", t_model.elapsed().as_secs_f64() * 1000.0);
+    let client = model.create_embedding_client();
+    vlog!(verbose, "run_index: embedding client ready");
+
     println!("Embedding {} chunks...", chunk_records.len());
+    let t_embed_total = std::time::Instant::now();
     for batch in chunk_records.chunks(32) {
         let texts: Vec<String> = batch.iter().map(|r| r.chunk_text.clone()).collect();
-        let embeddings = embed_batch(&client, &texts).await?;
+        vlog!(verbose, "run_index: embedding batch of {} chunks", texts.len());
+        let embeddings = embed_batch(&client, &texts, verbose).await?;
         for (record, embedding) in batch.iter().zip(embeddings.iter()) {
             conn.execute(
                 "INSERT INTO vec_chunks(rowid, embedding) VALUES (?1, ?2)",
@@ -387,6 +526,7 @@ async fn run_index(
             )?;
         }
     }
+    vlog!(verbose, "run_index: total embedding time (duration={:.1}ms)", t_embed_total.elapsed().as_secs_f64() * 1000.0);
 
     conn.execute(
         "UPDATE collections SET last_indexed_at_utc = ?1 WHERE name = ?2",
@@ -397,12 +537,18 @@ async fn run_index(
         "Indexed {} chunks into collection '{collection}'.",
         chunk_records.len()
     );
+    vlog!(
+        verbose,
+        "run_index(collection={collection}) -> {} chunks indexed",
+        chunk_records.len()
+    );
     Ok(())
 }
 
 // ── Collection ────────────────────────────────────────────────────────────────
 
-fn cmd_collection_ls(conn: &Connection) -> anyhow::Result<()> {
+fn cmd_collection_ls(conn: &Connection, verbose: bool) -> anyhow::Result<()> {
+    vlog!(verbose, "cmd_collection_ls()");
     let mut stmt = conn.prepare(
         "SELECT c.name, c.path, COUNT(DISTINCT d.id) as docs, COUNT(ch.id) as chunks, \
          c.last_indexed_at_utc \
@@ -423,6 +569,8 @@ fn cmd_collection_ls(conn: &Connection) -> anyhow::Result<()> {
         })?
         .filter_map(|r| r.ok())
         .collect();
+
+    vlog!(verbose, "cmd_collection_ls() -> {} collections", rows.len());
 
     if rows.is_empty() {
         println!("No collections.");
@@ -452,10 +600,18 @@ async fn cmd_collection_add(
     path: &Path,
     name: &str,
     description: Option<&str>,
+    verbose: bool,
 ) -> anyhow::Result<()> {
+    vlog!(
+        verbose,
+        "cmd_collection_add(path={}, name={}, description={:?})",
+        path.display(),
+        name,
+        description
+    );
     let canonical = std::fs::canonicalize(path)?;
     {
-        let conn = db_open(db_path)?;
+        let conn = db_open(db_path, verbose)?;
         let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) FROM collections WHERE name = ?1",
@@ -478,10 +634,13 @@ async fn cmd_collection_add(
             ],
         )?;
     }
-    run_index(db_path, &canonical, name, false).await
+    run_index(db_path, &canonical, name, false, verbose).await?;
+    vlog!(verbose, "cmd_collection_add(name={name}) -> ok");
+    Ok(())
 }
 
-fn cmd_collection_rm(conn: &Connection, name: &str) -> anyhow::Result<()> {
+fn cmd_collection_rm(conn: &Connection, name: &str, verbose: bool) -> anyhow::Result<()> {
+    vlog!(verbose, "cmd_collection_rm(name={name})");
     conn.execute(
         "DELETE FROM vec_chunks WHERE rowid IN \
          (SELECT id FROM chunks WHERE document_id IN \
@@ -496,10 +655,12 @@ fn cmd_collection_rm(conn: &Connection, name: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM documents WHERE collection = ?1", [name])?;
     conn.execute("DELETE FROM collections WHERE name = ?1", [name])?;
     println!("Removed collection '{name}'.");
+    vlog!(verbose, "cmd_collection_rm(name={name}) -> ok");
     Ok(())
 }
 
-fn cmd_collection_inspect(conn: &Connection, name: &str) -> anyhow::Result<()> {
+fn cmd_collection_inspect(conn: &Connection, name: &str, verbose: bool) -> anyhow::Result<()> {
+    vlog!(verbose, "cmd_collection_inspect(name={name})");
     let row: Option<(String, String, Option<String>, String, Option<String>)> = conn
         .query_row(
             "SELECT name, path, description, created_at_utc, last_indexed_at_utc \
@@ -538,46 +699,58 @@ fn cmd_collection_inspect(conn: &Connection, name: &str) -> anyhow::Result<()> {
     println!("Last indexed: {}", last_indexed.as_deref().unwrap_or("-"));
     println!("Documents:    {doc_count}");
     println!("Chunks:       {chunk_count}");
+    vlog!(
+        verbose,
+        "cmd_collection_inspect(name={name}) -> docs={doc_count} chunks={chunk_count}"
+    );
     Ok(())
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-fn resolve_db_path(flag: Option<&Path>) -> PathBuf {
+fn resolve_db_path(flag: Option<&Path>, verbose: bool) -> PathBuf {
     if let Some(p) = flag {
+        vlog!(verbose, "resolve_db_path() -> {} (source: --db flag)", p.display());
         return p.to_path_buf();
     }
     if let Ok(val) = std::env::var("SB_DB") {
-        return PathBuf::from(val);
+        let raw = PathBuf::from(&val);
+        let p = if raw.is_absolute() { raw } else { sb_home().join(&raw) };
+        vlog!(verbose, "resolve_db_path() -> {} (source: SB_DB env)", p.display());
+        return p;
     }
-    db_path_default()
+    let p = db_path_default();
+    vlog!(verbose, "resolve_db_path() -> {} (source: default)", p.display());
+    p
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     let cli = Cli::parse();
-    let db_path = resolve_db_path(cli.db.as_deref());
+    let verbose = cli.verbose;
+    let db_path = resolve_db_path(cli.db.as_deref(), verbose);
 
     match cli.command {
         Commands::Collection { action } => match action {
             CollectionCommands::Ls => {
-                let conn = db_open(&db_path)?;
-                cmd_collection_ls(&conn)?;
+                let conn = db_open(&db_path, verbose)?;
+                cmd_collection_ls(&conn, verbose)?;
             }
             CollectionCommands::Add {
                 path,
                 name,
                 description,
             } => {
-                cmd_collection_add(&db_path, &path, &name, description.as_deref()).await?;
+                cmd_collection_add(&db_path, &path, &name, description.as_deref(), verbose).await?;
             }
             CollectionCommands::Rm { name } => {
-                let conn = db_open(&db_path)?;
-                cmd_collection_rm(&conn, &name)?;
+                let conn = db_open(&db_path, verbose)?;
+                cmd_collection_rm(&conn, &name, verbose)?;
             }
             CollectionCommands::Inspect { name } => {
-                let conn = db_open(&db_path)?;
-                cmd_collection_inspect(&conn, &name)?;
+                let conn = db_open(&db_path, verbose)?;
+                cmd_collection_inspect(&conn, &name, verbose)?;
             }
         },
         Commands::Index {
@@ -596,7 +769,7 @@ async fn main() -> anyhow::Result<()> {
                         .into_owned()
                 });
                 {
-                    let conn = db_open(&db_path)?;
+                    let conn = db_open(&db_path, verbose)?;
                     let exists: bool = conn
                         .query_row(
                             "SELECT COUNT(*) FROM collections WHERE name = ?1",
@@ -606,6 +779,7 @@ async fn main() -> anyhow::Result<()> {
                         .map(|n| n > 0)
                         .unwrap_or(false);
                     if !exists {
+                        vlog!(verbose, "main: auto-registering collection '{coll_name}'");
                         conn.execute(
                             "INSERT INTO collections(name, path, description, created_at_utc) \
                              VALUES (?1, ?2, NULL, ?3)",
@@ -617,18 +791,19 @@ async fn main() -> anyhow::Result<()> {
                         )?;
                     }
                 }
-                run_index(&db_path, &p, &coll_name, force).await?;
+                run_index(&db_path, &p, &coll_name, force, verbose).await?;
             }
             (None, Some(col)) => {
                 let stored_path = {
-                    let conn = db_open(&db_path)?;
+                    let conn = db_open(&db_path, verbose)?;
                     conn.query_row(
                         "SELECT path FROM collections WHERE name = ?1",
                         [&col],
                         |row| row.get::<_, String>(0),
                     )?
                 };
-                run_index(&db_path, Path::new(&stored_path), &col, force).await?;
+                vlog!(verbose, "main: resolved collection '{col}' -> path={stored_path}");
+                run_index(&db_path, Path::new(&stored_path), &col, force, verbose).await?;
             }
         },
     }
