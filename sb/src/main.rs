@@ -213,6 +213,10 @@ struct DocMeta {
 // ── Pipeline ──────────────────────────────────────────────────────────────────
 
 fn build_symspell(verbose: bool) -> symspell::SymSpell<symspell::AsciiStringStrategy> {
+    if std::env::var("SB_NO_SPELL").as_deref() == Ok("1") {
+        vlog!(verbose, "build_symspell() -> spell correction disabled (SB_NO_SPELL=1)");
+        return symspell::SymSpell::default();
+    }
     let t = std::time::Instant::now();
     let mut sym = symspell::SymSpell::default();
     let (dict_path, dict_source) = if let Ok(val) = std::env::var("SB_DICT") {
@@ -979,8 +983,11 @@ async fn cmd_vsearch(
     );
     let client = model.create_embedding_client();
 
+    let sym = build_symspell(verbose);
+    let preprocessed_query = preprocess_text(query, &sym);
+    vlog!(verbose, "cmd_vsearch: preprocessed_query={:?}", preprocessed_query);
     let t_embed = std::time::Instant::now();
-    let embedding = embed_one(&client, query, verbose).await?;
+    let embedding = embed_one(&client, &preprocessed_query, verbose).await?;
     let embedding_bytes = embedding.as_slice().as_bytes();
     vlog!(
         verbose,
