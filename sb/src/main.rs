@@ -175,10 +175,24 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
             FOREIGN KEY (document_id) REFERENCES documents(id)
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks
-        USING vec0(embedding float[1024]);
-        CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks
-        USING fts5(chunk_text, content=chunks, content_rowid=id);",
+        USING vec0(embedding float[1024]);",
     )?;
+    // Migrate fts_chunks from old single-column content table to 3-column standalone
+    // (required for weighted bm25() scoring across title, tags, chunk_text)
+    let has_title_col: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('fts_chunks') WHERE name = 'title'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if has_title_col == 0 {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS fts_chunks;
+             CREATE VIRTUAL TABLE fts_chunks USING fts5(title, tags, chunk_text);",
+        )?;
+        eprintln!("FTS index schema upgraded — run: sb index --force to rebuild");
+    }
     Ok(())
 }
 
@@ -241,6 +255,29 @@ fn clean_text(text: &str) -> String {
     punct
         .replace_all(&ws.replace_all(text, " "), "")
         .to_lowercase()
+}
+
+fn preprocess_text(
+    text: &str,
+    sym: &symspell::SymSpell<symspell::AsciiStringStrategy>,
+) -> String {
+    correct_spelling(&clean_text(text), sym)
+}
+
+fn build_fts5_query(preprocessed: &str) -> Option<String> {
+    let tokens: Vec<&str> = preprocessed
+        .split_whitespace()
+        .filter(|t| t.len() >= 2)
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let fts_query = tokens
+        .iter()
+        .map(|t| format!("\"{}\"*", t))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Some(fts_query)
 }
 
 fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
@@ -505,9 +542,11 @@ async fn run_index(
             ],
         )?;
 
-        let cleaned = clean_text(&body);
-        let corrected = correct_spelling(&cleaned, &sym);
-        let chunks = chunk_text(&corrected, 512);
+        let doc_title = meta.title.as_deref().unwrap_or("").to_string();
+        let doc_tags = meta.tags.as_ref().map(|t| t.join(" ")).unwrap_or_default();
+
+        let preprocessed = preprocess_text(&body, &sym);
+        let chunks = chunk_text(&preprocessed, 512);
 
         for (idx, chunk) in chunks.iter().enumerate() {
             conn.execute(
@@ -516,8 +555,8 @@ async fn run_index(
             )?;
             let chunk_id = conn.last_insert_rowid();
             conn.execute(
-                "INSERT INTO fts_chunks(rowid, chunk_text) VALUES (?1, ?2)",
-                rusqlite::params![chunk_id, chunk],
+                "INSERT INTO fts_chunks(rowid, title, tags, chunk_text) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![chunk_id, doc_title, doc_tags, chunk],
             )?;
             chunk_records.push(ChunkRecord {
                 chunk_id,
@@ -803,71 +842,102 @@ fn cmd_search(
     let t = std::time::Instant::now();
     vlog!(verbose, "cmd_search(query={:?}, collection={:?}, top_k={})", query, collection, top_k);
 
+    let sym = build_symspell(verbose);
+    let preprocessed = preprocess_text(query, &sym);
+    let fts_query = match build_fts5_query(&preprocessed) {
+        Some(q) => q,
+        None => {
+            vlog!(verbose, "cmd_search() -> empty query after preprocessing (duration={:.1}ms)", t.elapsed().as_secs_f64() * 1000.0);
+            println!("No results for {:?}.", query);
+            return Ok(());
+        }
+    };
+    vlog!(verbose, "cmd_search: fts_query={:?}", fts_query);
+
     type Row6 = (f64, String, String, String, Option<String>, String);
 
-    let rows: Vec<Row6> = {
-        let (sql, params_coll): (&str, Option<&str>) = if collection.is_some() {
-            (
-                "SELECT -fts.rank, ch.chunk_text, d.id, d.path, d.title, d.collection \
-                 FROM fts_chunks fts \
-                 JOIN chunks ch ON ch.id = fts.rowid \
-                 JOIN documents d ON d.id = ch.document_id \
-                 WHERE fts.chunk_text MATCH ?1 AND d.collection = ?2 \
-                 ORDER BY fts.rank LIMIT ?3",
-                collection,
-            )
-        } else {
-            (
-                "SELECT -fts.rank, ch.chunk_text, d.id, d.path, d.title, d.collection \
-                 FROM fts_chunks fts \
-                 JOIN chunks ch ON ch.id = fts.rowid \
-                 JOIN documents d ON d.id = ch.document_id \
-                 WHERE fts.chunk_text MATCH ?1 \
-                 ORDER BY fts.rank LIMIT ?2",
-                None,
-            )
-        };
-
-        let mut stmt = conn.prepare(sql)?;
-        let rows_iter = if let Some(coll) = params_coll {
-            stmt.query_map(rusqlite::params![query, coll, top_k as i64], |row| {
-                Ok((
-                    row.get::<_, f64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })?
+    let rows: Vec<Row6> = if let Some(coll) = collection {
+        let fetch_k = top_k * 10;
+        let mut stmt = conn.prepare(
+            "WITH fts_matches AS (
+                 SELECT rowid, bm25(fts_chunks, 2.0, 1.5, 1.0) AS bm25_score
+                 FROM fts_chunks
+                 WHERE fts_chunks MATCH ?1
+                 ORDER BY bm25_score ASC
+                 LIMIT ?2
+             )
+             SELECT fm.bm25_score, ch.chunk_text, d.id, d.path, d.title, d.collection
+             FROM fts_matches fm
+             JOIN chunks ch ON ch.id = fm.rowid
+             JOIN documents d ON d.id = ch.document_id
+             WHERE d.collection = ?3
+             ORDER BY fm.bm25_score ASC
+             LIMIT ?4",
+        )?;
+        let r: Vec<Row6> = stmt
+            .query_map(
+                rusqlite::params![fts_query, fetch_k as i64, coll, top_k as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?
             .filter_map(|r| r.ok())
-            .collect::<Vec<Row6>>()
-        } else {
-            stmt.query_map(rusqlite::params![query, top_k as i64], |row| {
-                Ok((
-                    row.get::<_, f64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })?
+            .collect();
+        r
+    } else {
+        let mut stmt = conn.prepare(
+            "WITH fts_matches AS (
+                 SELECT rowid, bm25(fts_chunks, 2.0, 1.5, 1.0) AS bm25_score
+                 FROM fts_chunks
+                 WHERE fts_chunks MATCH ?1
+                 ORDER BY bm25_score ASC
+                 LIMIT ?2
+             )
+             SELECT fm.bm25_score, ch.chunk_text, d.id, d.path, d.title, d.collection
+             FROM fts_matches fm
+             JOIN chunks ch ON ch.id = fm.rowid
+             JOIN documents d ON d.id = ch.document_id
+             ORDER BY fm.bm25_score ASC
+             LIMIT ?2",
+        )?;
+        let r: Vec<Row6> = stmt
+            .query_map(
+                rusqlite::params![fts_query, top_k as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?
             .filter_map(|r| r.ok())
-            .collect::<Vec<Row6>>()
-        };
-        rows_iter
+            .collect();
+        r
     };
 
     let results: Vec<SearchResult> = rows
         .into_iter()
-        .map(|(score, snippet, doc_id, path, title, coll)| SearchResult {
-            docid: short_docid(&doc_id),
-            score,
-            file: build_file_uri(&coll, &path),
-            title,
-            context: coll,
-            snippet,
+        .map(|(raw_score, snippet, doc_id, path, title, coll)| {
+            let score = raw_score.abs() / (1.0 + raw_score.abs());
+            SearchResult {
+                docid: short_docid(&doc_id),
+                score,
+                file: build_file_uri(&coll, &path),
+                title,
+                context: coll,
+                snippet,
+            }
         })
         .collect();
 
