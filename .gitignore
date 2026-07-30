@@ -6,7 +6,6 @@
 target/
 .specify
 specs
-.github
 .foam
 .copilot-tracking
 sh.exe.stackdump
