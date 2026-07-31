@@ -890,8 +890,7 @@ fn cmd_search(
                     ))
                 },
             )?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         r
     } else {
         let mut stmt = conn.prepare(
