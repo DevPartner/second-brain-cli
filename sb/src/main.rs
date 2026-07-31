@@ -179,13 +179,11 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
     )?;
     // Migrate fts_chunks from old single-column content table to 3-column standalone
     // (required for weighted bm25() scoring across title, tags, chunk_text)
-    let has_title_col: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('fts_chunks') WHERE name = 'title'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let has_title_col: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('fts_chunks') WHERE name = 'title'",
+        [],
+        |row| row.get(0),
+    )?;
     if has_title_col == 0 {
         conn.execute_batch(
             "DROP TABLE IF EXISTS fts_chunks;
