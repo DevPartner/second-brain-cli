@@ -161,11 +161,22 @@ Each search result returned from `sb` contains:
 
 ## Configuration
 
+### `sb` environment variables
+
+| Variable      | Default              | Description                                                                                       |
+| ------------- | -------------------- | ------------------------------------------------------------------------------------------------- |
+| `SB_DB`       | `~/.sb/sb.db`        | SQLite database path (also overridable with `--db`)                                               |
+| `SB_MODEL`    | `qwen3-embedding-0.6b` | Foundry Local embedding model alias used during indexing and `vsearch`                          |
+| `SB_DICT`     | `~/.sb/en-80k.txt`   | Path to the SymSpell dictionary file. Relative paths are resolved from `~/.sb/`. Spell correction is silently disabled when the file is absent. |
+| `SB_NO_SPELL` | _(unset)_            | Set to `1` to skip spell correction in all pipelines (indexing, `search`, `vsearch`). Useful when latency matters or the dictionary is unavailable. |
+
+### `sb-mcp-server` environment variables
+
 | Variable | Default       | Description                                                                     |
 | -------- | ------------- | ------------------------------------------------------------------------------- |
 | `SB_CMD` | `sb`          | Command used to invoke the `sb` binary. Supports prefix args: `node C:/path/sb` |
 | `PORT`   | `3000`        | HTTP port for `sb-mcp-server`                                                   |
-| `SB_DB`  | `~/.sb/sb.db` | SQLite database path (also overridable with `--db` in `sb`)                     |
+| `SB_DB`  | `~/.sb/sb.db` | SQLite database path forwarded to `sb`                                          |
 
 ## Database schema
 
@@ -184,7 +195,7 @@ Each document goes through the following pipeline before embedding:
 
 1. **YAML front matter** parsed with `gray_matter` (fields: `title`, `tags`, `created`, `type`)
 2. **Clean** — collapse whitespace, strip non-word characters, lowercase
-3. **Spell-correct** — word-level correction via `symspell` (dictionary at `~/.sb/en-80k.txt`)
+3. **Spell-correct** — word-level correction via `symspell` (dictionary at `~/.sb/en-80k.txt`, override with `SB_DICT`; set `SB_NO_SPELL=1` to skip)
 4. **Chunk** — split into 512-character chunks with `text-splitter`
 5. **Embed** — batch embed (32 chunks per call) via Foundry Local SDK
 6. **Store** — insert into `documents`, `chunks`, and `vec_chunks`
