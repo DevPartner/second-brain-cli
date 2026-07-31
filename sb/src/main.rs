@@ -1068,9 +1068,8 @@ fn cmd_get(
         conn.query_row(
             "SELECT d.id, d.path, d.title, d.tags, d.doc_type, d.collection, \
              d.created_at_utc, d.updated_at_utc, \
-             GROUP_CONCAT(ch.chunk_text, char(10)) AS full_text \
+             (SELECT GROUP_CONCAT(chunk_text, char(10)) FROM (SELECT chunk_text FROM chunks WHERE document_id = d.id ORDER BY chunk_index)) AS full_text \
              FROM documents d \
-             JOIN chunks ch ON ch.document_id = d.id \
              WHERE d.id LIKE ?1 || '%' AND d.collection = ?2 \
              GROUP BY d.id",
             rusqlite::params![id_clean, coll],
