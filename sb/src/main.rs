@@ -2,7 +2,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use foundry_local_sdk::{FoundryLocalConfig, FoundryLocalManager};
 use gray_matter::{engine::YAML, Matter};
-use rusqlite::{ffi::sqlite3_auto_extension, Connection};
+use rusqlite::{ffi::sqlite3_auto_extension, Connection, OptionalExtension};
 use sqlite_vec::sqlite3_vec_init;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -51,6 +51,42 @@ enum Commands {
         /// Re-embed all documents even if already indexed
         #[arg(long)]
         force: bool,
+    },
+    /// Search notes using BM25 keyword matching
+    Search {
+        /// Search query text
+        query: String,
+        /// Output results as JSON array
+        #[arg(long)]
+        json: bool,
+        /// Maximum number of results to return
+        #[arg(short = 'n', long, default_value = "10")]
+        top_k: usize,
+        /// Restrict search to this collection
+        #[arg(short, long)]
+        collection: Option<String>,
+    },
+    /// Search notes using semantic vector similarity
+    Vsearch {
+        /// Search query text
+        query: String,
+        /// Output results as JSON array
+        #[arg(long)]
+        json: bool,
+        /// Maximum number of results to return
+        #[arg(short = 'n', long, default_value = "10")]
+        top_k: usize,
+        /// Restrict search to this collection
+        #[arg(short, long)]
+        collection: Option<String>,
+    },
+    /// Retrieve a document by its ID
+    Get {
+        /// Document ID (short hex #prefix or full UUID)
+        id: String,
+        /// Restrict lookup to this collection
+        #[arg(short, long)]
+        collection: Option<String>,
     },
 }
 
@@ -141,6 +177,20 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks
         USING vec0(embedding float[1024]);",
     )?;
+    // Migrate fts_chunks from old single-column content table to 3-column standalone
+    // (required for weighted bm25() scoring across title, tags, chunk_text)
+    let has_title_col: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('fts_chunks') WHERE name = 'title'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_title_col == 0 {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS fts_chunks;
+             CREATE VIRTUAL TABLE fts_chunks USING fts5(title, tags, chunk_text);",
+        )?;
+        eprintln!("FTS index schema upgraded — run: sb index --force to rebuild");
+    }
     Ok(())
 }
 
@@ -161,6 +211,10 @@ struct DocMeta {
 // ── Pipeline ──────────────────────────────────────────────────────────────────
 
 fn build_symspell(verbose: bool) -> symspell::SymSpell<symspell::AsciiStringStrategy> {
+    if std::env::var("SB_NO_SPELL").as_deref() == Ok("1") {
+        vlog!(verbose, "build_symspell() -> spell correction disabled (SB_NO_SPELL=1)");
+        return symspell::SymSpell::default();
+    }
     let t = std::time::Instant::now();
     let mut sym = symspell::SymSpell::default();
     let (dict_path, dict_source) = if let Ok(val) = std::env::var("SB_DICT") {
@@ -203,6 +257,29 @@ fn clean_text(text: &str) -> String {
     punct
         .replace_all(&ws.replace_all(text, " "), "")
         .to_lowercase()
+}
+
+fn preprocess_text(
+    text: &str,
+    sym: &symspell::SymSpell<symspell::AsciiStringStrategy>,
+) -> String {
+    correct_spelling(&clean_text(text), sym)
+}
+
+fn build_fts5_query(preprocessed: &str) -> Option<String> {
+    let tokens: Vec<&str> = preprocessed
+        .split_whitespace()
+        .filter(|t| t.len() >= 2)
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let fts_query = tokens
+        .iter()
+        .map(|t| format!("\"{}\"*", t))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Some(fts_query)
 }
 
 fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
@@ -392,6 +469,7 @@ async fn run_index(
             [collection],
         )?;
         conn.execute("DELETE FROM documents WHERE collection = ?1", [collection])?;
+        conn.execute_batch("INSERT INTO fts_chunks(fts_chunks) VALUES('rebuild')")?;
     }
 
     let exclusions = load_search_exclusions(path, verbose);
@@ -466,9 +544,11 @@ async fn run_index(
             ],
         )?;
 
-        let cleaned = clean_text(&body);
-        let corrected = correct_spelling(&cleaned, &sym);
-        let chunks = chunk_text(&corrected, 512);
+        let doc_title = meta.title.as_deref().unwrap_or("").to_string();
+        let doc_tags = meta.tags.as_ref().map(|t| t.join(" ")).unwrap_or_default();
+
+        let preprocessed = preprocess_text(&body, &sym);
+        let chunks = chunk_text(&preprocessed, 512);
 
         for (idx, chunk) in chunks.iter().enumerate() {
             conn.execute(
@@ -476,6 +556,10 @@ async fn run_index(
                 rusqlite::params![doc_id, idx as i64, chunk],
             )?;
             let chunk_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO fts_chunks(rowid, title, tags, chunk_text) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![chunk_id, doc_title, doc_tags, chunk],
+            )?;
             chunk_records.push(ChunkRecord {
                 chunk_id,
                 chunk_text: chunk.clone(),
@@ -654,6 +738,7 @@ fn cmd_collection_rm(conn: &Connection, name: &str, verbose: bool) -> anyhow::Re
     )?;
     conn.execute("DELETE FROM documents WHERE collection = ?1", [name])?;
     conn.execute("DELETE FROM collections WHERE name = ?1", [name])?;
+    conn.execute_batch("INSERT INTO fts_chunks(fts_chunks) VALUES('rebuild')")?;
     println!("Removed collection '{name}'.");
     vlog!(verbose, "cmd_collection_rm(name={name}) -> ok");
     Ok(())
@@ -703,6 +788,350 @@ fn cmd_collection_inspect(conn: &Connection, name: &str, verbose: bool) -> anyho
         verbose,
         "cmd_collection_inspect(name={name}) -> docs={doc_count} chunks={chunk_count}"
     );
+    Ok(())
+}
+
+// ── Search ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize)]
+struct SearchResult {
+    docid: String,
+    score: f64,
+    file: String,
+    title: Option<String>,
+    context: String,
+    snippet: String,
+}
+
+fn short_docid(uuid: &str) -> String {
+    format!("#{}", &uuid[..uuid.len().min(7)])
+}
+
+fn build_file_uri(collection: &str, path: &str) -> String {
+    format!("sb://{collection}/{path}")
+}
+
+fn output_search_results(
+    results: &[SearchResult],
+    json_output: bool,
+    query: &str,
+) -> anyhow::Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(results)?);
+    } else if results.is_empty() {
+        println!("No results for {query:?}.");
+    } else {
+        for (i, r) in results.iter().enumerate() {
+            println!("\n[{}] {} (score: {:.4})", i + 1, r.file, r.score);
+            if let Some(t) = &r.title {
+                println!("    Title: {t}");
+            }
+            let preview: String = r.snippet.chars().take(120).collect();
+            println!("    {preview}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_search(
+    conn: &Connection,
+    query: &str,
+    collection: Option<&str>,
+    top_k: usize,
+    json_output: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let t = std::time::Instant::now();
+    vlog!(verbose, "cmd_search(query={:?}, collection={:?}, top_k={})", query, collection, top_k);
+
+    let sym = build_symspell(verbose);
+    let preprocessed = preprocess_text(query, &sym);
+    let fts_query = match build_fts5_query(&preprocessed) {
+        Some(q) => q,
+        None => {
+            vlog!(verbose, "cmd_search() -> empty query after preprocessing (duration={:.1}ms)", t.elapsed().as_secs_f64() * 1000.0);
+            println!("No results for {:?}.", query);
+            return Ok(());
+        }
+    };
+    vlog!(verbose, "cmd_search: fts_query={:?}", fts_query);
+
+    type Row6 = (f64, String, String, String, Option<String>, String);
+
+    let rows: Vec<Row6> = if let Some(coll) = collection {
+        let fetch_k = top_k * 10;
+        let mut stmt = conn.prepare(
+            "WITH fts_matches AS (
+                 SELECT rowid, bm25(fts_chunks, 2.0, 1.5, 1.0) AS bm25_score
+                 FROM fts_chunks
+                 WHERE fts_chunks MATCH ?1
+                 ORDER BY bm25_score ASC
+                 LIMIT ?2
+             )
+             SELECT fm.bm25_score, ch.chunk_text, d.id, d.path, d.title, d.collection
+             FROM fts_matches fm
+             JOIN chunks ch ON ch.id = fm.rowid
+             JOIN documents d ON d.id = ch.document_id
+             WHERE d.collection = ?3
+             ORDER BY fm.bm25_score ASC
+             LIMIT ?4",
+        )?;
+        let r: Vec<Row6> = stmt
+            .query_map(
+                rusqlite::params![fts_query, fetch_k as i64, coll, top_k as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        r
+    } else {
+        let mut stmt = conn.prepare(
+            "WITH fts_matches AS (
+                 SELECT rowid, bm25(fts_chunks, 2.0, 1.5, 1.0) AS bm25_score
+                 FROM fts_chunks
+                 WHERE fts_chunks MATCH ?1
+                 ORDER BY bm25_score ASC
+                 LIMIT ?2
+             )
+             SELECT fm.bm25_score, ch.chunk_text, d.id, d.path, d.title, d.collection
+             FROM fts_matches fm
+             JOIN chunks ch ON ch.id = fm.rowid
+             JOIN documents d ON d.id = ch.document_id
+             ORDER BY fm.bm25_score ASC
+             LIMIT ?2",
+        )?;
+        let r: Vec<Row6> = stmt
+            .query_map(
+                rusqlite::params![fts_query, top_k as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
+        r
+    };
+
+    let results: Vec<SearchResult> = rows
+        .into_iter()
+        .map(|(raw_score, snippet, doc_id, path, title, coll)| {
+            let score = raw_score.abs() / (1.0 + raw_score.abs());
+            SearchResult {
+                docid: short_docid(&doc_id),
+                score,
+                file: build_file_uri(&coll, &path),
+                title,
+                context: coll,
+                snippet,
+            }
+        })
+        .collect();
+
+    vlog!(
+        verbose,
+        "cmd_search() -> {} results (duration={:.1}ms)",
+        results.len(),
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    output_search_results(&results, json_output, query)
+}
+
+async fn cmd_vsearch(
+    db_path: &Path,
+    query: &str,
+    collection: Option<&str>,
+    top_k: usize,
+    json_output: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let t = std::time::Instant::now();
+    vlog!(verbose, "cmd_vsearch(query={:?}, collection={:?}, top_k={})", query, collection, top_k);
+
+    let model_alias = std::env::var("SB_MODEL").unwrap_or_else(|_| ALIAS.to_string());
+    vlog!(verbose, "cmd_vsearch: loading embedding model '{model_alias}'");
+    let t_model = std::time::Instant::now();
+    let manager = FoundryLocalManager::create(FoundryLocalConfig::new("sb"))?;
+    let model = manager.catalog().get_model(&model_alias).await?;
+    if !model.is_cached().await? {
+        anyhow::bail!(
+            "Embedding model '{model_alias}' not cached. Run `sb index` first to download it."
+        );
+    }
+    model.load().await?;
+    vlog!(
+        verbose,
+        "cmd_vsearch: model loaded (duration={:.1}ms)",
+        t_model.elapsed().as_secs_f64() * 1000.0
+    );
+    let client = model.create_embedding_client();
+
+    let sym = build_symspell(verbose);
+    let preprocessed_query = preprocess_text(query, &sym);
+    vlog!(verbose, "cmd_vsearch: preprocessed_query={:?}", preprocessed_query);
+    let t_embed = std::time::Instant::now();
+    let embedding = embed_one(&client, &preprocessed_query, verbose).await?;
+    let embedding_bytes = embedding.as_slice().as_bytes();
+    vlog!(
+        verbose,
+        "cmd_vsearch: query embedded (duration={:.1}ms)",
+        t_embed.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // sqlite-vec applies k to the vector index before the JOIN, so when a collection filter
+    // is used the post-JOIN filter may reduce the count below top_k — fetch more to compensate.
+    let fetch_k = if collection.is_some() { top_k * 10 } else { top_k };
+
+    let conn = db_open(db_path, verbose)?;
+    let t_query = std::time::Instant::now();
+    let mut stmt = conn.prepare(
+        "WITH knn AS (
+             SELECT rowid, distance
+             FROM vec_chunks
+             WHERE embedding MATCH ?1 AND k = ?2
+         )
+         SELECT knn.distance, ch.chunk_text, d.id, d.path, d.title, d.collection
+         FROM knn
+         JOIN chunks ch ON ch.id = knn.rowid
+         JOIN documents d ON d.id = ch.document_id
+         ORDER BY knn.distance",
+    )?;
+    let raw: Vec<_> = stmt
+        .query_map(rusqlite::params![embedding_bytes, fetch_k as i64], |row| {
+            Ok((
+                row.get::<_, f64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let results: Vec<SearchResult> = raw
+        .into_iter()
+        .filter(|(_, _, _, _, _, coll)| collection.map_or(true, |c| coll == c))
+        .take(top_k)
+        .map(|(distance, snippet, doc_id, path, title, coll)| SearchResult {
+            docid: short_docid(&doc_id),
+            score: 1.0 / (1.0 + distance),
+            file: build_file_uri(&coll, &path),
+            title,
+            context: coll,
+            snippet,
+        })
+        .collect();
+
+    vlog!(
+        verbose,
+        "cmd_vsearch: KNN query -> {} results (duration={:.1}ms)",
+        results.len(),
+        t_query.elapsed().as_secs_f64() * 1000.0
+    );
+    vlog!(
+        verbose,
+        "cmd_vsearch() total (duration={:.1}ms)",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    output_search_results(&results, json_output, query)
+}
+
+fn cmd_get(
+    conn: &Connection,
+    id: &str,
+    collection: Option<&str>,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    vlog!(verbose, "cmd_get(id={:?}, collection={:?})", id, collection);
+    let id_clean = id.trim_start_matches('#');
+
+    let row = if let Some(coll) = collection {
+        conn.query_row(
+            "SELECT d.id, d.path, d.title, d.tags, d.doc_type, d.collection, \
+             d.created_at_utc, d.updated_at_utc, \
+             (SELECT GROUP_CONCAT(chunk_text, char(10)) FROM (SELECT chunk_text FROM chunks WHERE document_id = d.id ORDER BY chunk_index)) AS full_text \
+             FROM documents d \
+             WHERE d.id LIKE ?1 || '%' AND d.collection = ?2 \
+             GROUP BY d.id",
+            rusqlite::params![id_clean, coll],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()?
+    } else {
+        conn.query_row(
+            "SELECT d.id, d.path, d.title, d.tags, d.doc_type, d.collection, \
+             d.created_at_utc, d.updated_at_utc, \
+             GROUP_CONCAT(ch.chunk_text, char(10)) AS full_text \
+             FROM documents d \
+             JOIN chunks ch ON ch.document_id = d.id \
+             WHERE d.id LIKE ?1 || '%' \
+             GROUP BY d.id",
+            rusqlite::params![id_clean],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()?
+    };
+
+    let (doc_id, path, title, tags_json, doc_type, coll, created, updated, full_text) =
+        row.ok_or_else(|| anyhow::anyhow!("Document '{}' not found", id))?;
+
+    let tags: Option<serde_json::Value> = tags_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    let result = serde_json::json!({
+        "docid":          short_docid(&doc_id),
+        "file":           build_file_uri(&coll, &path),
+        "title":          title,
+        "tags":           tags,
+        "doc_type":       doc_type,
+        "collection":     coll,
+        "created_at_utc": created,
+        "updated_at_utc": updated,
+        "full_text":      full_text,
+    });
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    vlog!(verbose, "cmd_get(id={:?}) -> found document in '{coll}'", id);
     Ok(())
 }
 
@@ -806,6 +1235,27 @@ async fn main() -> anyhow::Result<()> {
                 run_index(&db_path, Path::new(&stored_path), &col, force, verbose).await?;
             }
         },
+        Commands::Search {
+            query,
+            json,
+            top_k,
+            collection,
+        } => {
+            let conn = db_open(&db_path, verbose)?;
+            cmd_search(&conn, &query, collection.as_deref(), top_k, json, verbose)?;
+        }
+        Commands::Vsearch {
+            query,
+            json,
+            top_k,
+            collection,
+        } => {
+            cmd_vsearch(&db_path, &query, collection.as_deref(), top_k, json, verbose).await?;
+        }
+        Commands::Get { id, collection } => {
+            let conn = db_open(&db_path, verbose)?;
+            cmd_get(&conn, &id, collection.as_deref(), verbose)?;
+        }
     }
     Ok(())
 }
