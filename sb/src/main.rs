@@ -2,7 +2,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use foundry_local_sdk::{FoundryLocalConfig, FoundryLocalManager};
 use gray_matter::{engine::YAML, Matter};
-use rusqlite::{ffi::sqlite3_auto_extension, Connection};
+use rusqlite::{ffi::sqlite3_auto_extension, Connection, OptionalExtension};
 use sqlite_vec::sqlite3_vec_init;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -1084,7 +1084,7 @@ fn cmd_get(
                 ))
             },
         )
-        .ok()
+        .optional()?
     } else {
         conn.query_row(
             "SELECT d.id, d.path, d.title, d.tags, d.doc_type, d.collection, \
@@ -1109,7 +1109,7 @@ fn cmd_get(
                 ))
             },
         )
-        .ok()
+        .optional()?
     };
 
     let (doc_id, path, title, tags_json, doc_type, coll, created, updated, full_text) =
