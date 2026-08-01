@@ -174,6 +174,7 @@ Update after **every** task completion by appending to the relevant section.
 
 - `/task-researcher` — research a topic, produce a research file in `.copilot-tracking/research/`
 - `/task-planner` — validate research, produce plan + details + prompt files
+- `/sb-logging` - Verbose Logging Conventions
 
 ---
 
