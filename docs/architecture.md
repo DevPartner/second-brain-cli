@@ -217,7 +217,6 @@ C4Context
     Rel(sb, sqlite, "Read / write documents, chunks, embeddings")
     Rel(sb, fs, "Walk directories; read .md files")
     Rel(mcp, sb, "Spawns sb as subprocess")
-
 ```
 
 ### Deployment
