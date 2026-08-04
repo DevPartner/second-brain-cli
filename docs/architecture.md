@@ -6,7 +6,7 @@ tags: [architecture, rag, second-brain]
 
 # second-brain-cli — Architecture
 
-> Local-first RAG knowledge retrieval: Rust CLI + SQLite + Foundry Local
+> Local-first RAG(retrieval-augmented generation) knowledge retrieval: Rust CLI + SQLite + Foundry Local
 
 ---
 
