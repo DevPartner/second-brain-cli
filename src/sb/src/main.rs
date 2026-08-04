@@ -276,7 +276,7 @@ fn build_fts5_query(preprocessed: &str) -> Option<String> {
     }
     let fts_query = tokens
         .iter()
-        .map(|t| format!("\"{}\"*", t))
+        .map(|t| format!("{}*", t))
         .collect::<Vec<_>>()
         .join(" OR ");
     Some(fts_query)
