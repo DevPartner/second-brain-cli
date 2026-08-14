@@ -174,7 +174,10 @@ impl ServerHandler for SbMcpServer {
         ServerInfo::new(
             ServerCapabilities::builder().enable_tools().build(),
         )
-        .with_server_info(Implementation::from_build_env())
+        .with_server_info(
+            Implementation::from_build_env()
+                .with_description(env!("CARGO_PKG_DESCRIPTION")),
+        )
     }
 }
 
