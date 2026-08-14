@@ -15,6 +15,7 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
@@ -259,7 +260,7 @@ async fn main() {
 
     let mcp_service = StreamableHttpService::new(
         || Ok(SbMcpServer::new()),
-        LocalSessionManager::default().into(),
+        Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );
 
